@@ -3,8 +3,10 @@
 #include <libsoup/soup.h>
 #include <json-glib/json-glib.h>
 #include <glib-unix.h>
+#include <limits.h>
 #include <math.h>
 #include <signal.h>
+#include <stdlib.h>
 #include <string.h>
 
 #define STATUS_URL "http://127.0.0.1:8088/status.json"
@@ -20,7 +22,7 @@ typedef struct {
     GCancellable *cancel;
     GInputStream *stream;
     GByteArray *body;
-    guint timer;
+    guint timer, request_timer;
     gboolean pending, stopping;
 } App;
 
@@ -306,7 +308,7 @@ static void capacity(char *s, gsize len, double used, double total) {
     g_snprintf(s, len, "%s / %s", u, t);
 }
 static void uptime(char *s, gsize len, double v) {
-    if (!isfinite(v) || v < 0) { g_strlcpy(s, "—", len); return; }
+    if (!isfinite(v) || v < 0 || v >= (double)LONG_MAX) { g_strlcpy(s, "—", len); return; }
     long total = (long)v;
     if (total >= 86400) g_snprintf(s, len, "%ld d %02ld h", total / 86400, total % 86400 / 3600);
     else if (total >= 3600) g_snprintf(s, len, "%ld h %02ld m", total / 3600, total % 3600 / 60);
@@ -323,6 +325,9 @@ static void stamp(char *s, gsize len, const char *raw) {
         return;
     }
     g_strlcpy(s, raw, len);
+    /* A byte limit may split a multibyte label; Pango requires valid UTF-8. */
+    const char *end = NULL;
+    if (len && !g_utf8_validate(s, -1, &end)) s[end - s] = '\0';
 }
 static void ago(char *s, gsize len, double v) {
     if (!isfinite(v) || v < 0) g_strlcpy(s, "—", len);
@@ -392,10 +397,12 @@ static void host_card(cairo_t *cr, double top, JsonObject *host, JsonArray *hist
         paint(cr, used >= 90 ? INK_ALERT : INK_WIRE);
         cairo_rectangle(cr, C1, top + 488, COL * CLAMP(used / 100, 0, 1), 4); cairo_fill(cr);
     }
-    if (workstation) g_snprintf(value, sizeof value, "Agent %s", string(host, "agent_version", "—"));
+    char *detail;
+    if (workstation) detail = g_strdup_printf("Agent %s", string(host, "agent_version", "—"));
     else { char duration[64]; uptime(duration, sizeof duration, number(host, "uptime_seconds"));
-        g_snprintf(value, sizeof value, "Uptime  %s", duration); }
-    text(cr, value, C1, top + 550, T_META, INK_FAINT, COL, FALSE);
+        detail = g_strdup_printf("Uptime  %s", duration); }
+    text(cr, detail, C1, top + 550, T_META, INK_FAINT, COL, FALSE);
+    g_free(detail);
     const char *down[] = {"network_down"}, *up[] = {"network_up"};
     spark(cr, history, down, 1, C2, top + 490, COL, 70, NULL);
     spark(cr, history, up, 1, C3, top + 490, COL, 70, NULL);
@@ -489,6 +496,10 @@ static gboolean draw(GtkWidget *area, cairo_t *cr, gpointer data) {
     return FALSE;
 }
 static void finish_request(App *a, gboolean ok) {
+    if (a->request_timer) {
+        g_source_remove(a->request_timer);
+        a->request_timer = 0;
+    }
     gboolean changed = a->connected != ok;
     if (ok) {
         JsonParser *old = a->parser ? g_object_ref(a->parser) : NULL;
@@ -531,10 +542,19 @@ static void response(GObject *source, GAsyncResult *result, gpointer data) {
     a->body = g_byte_array_new();
     g_input_stream_read_bytes_async(a->stream, 16384, G_PRIORITY_DEFAULT, a->cancel, read_chunk, a);
 }
+/* Socket inactivity timeouts alone do not bound a slowly trickling response. */
+static gboolean request_expired(gpointer data) {
+    App *a = data;
+    a->request_timer = 0;
+    g_cancellable_cancel(a->cancel);
+    return G_SOURCE_REMOVE;
+}
 static gboolean refresh(gpointer data) {
     App *a = data;
     if (!a->pending && !a->stopping) {
         a->pending = TRUE;
+        g_cancellable_reset(a->cancel);
+        a->request_timer = g_timeout_add(5000, request_expired, a);
         a->message = soup_message_new("GET", STATUS_URL);
         soup_session_send_async(a->session, a->message, G_PRIORITY_DEFAULT, a->cancel, response, a);
     }
@@ -612,6 +632,28 @@ static int self_test(void) {
     g_assert_false(accept_payload(&a, "[]", -1));
     g_assert_false(accept_payload(&a, "{", -1));
     g_assert_cmpfloat(number(root(&a), "n"), ==, 4.2);
+    char formatted[64];
+    uptime(formatted, sizeof formatted, 195846);
+    g_assert_cmpstr(formatted, ==, "2 d 06 h");
+    const double invalid_uptimes[] = {NAN, INFINITY, -1, (double)LONG_MAX, 1e300};
+    for (guint i = 0; i < G_N_ELEMENTS(invalid_uptimes); i++) {
+        uptime(formatted, sizeof formatted, invalid_uptimes[i]);
+        g_assert_cmpstr(formatted, ==, "—");
+    }
+    stamp(formatted, 5, "한국어");
+    g_assert_cmpstr(formatted, ==, "한");
+    stamp(formatted, sizeof formatted, "2026-09-28T11:37:47.123456+00:00");
+    g_assert_cmpstr(formatted, ==, "2026-09-28T11:37:47");
+    App request = {.stopping = TRUE, .pending = TRUE, .cancel = g_cancellable_new()};
+    request.request_timer = g_timeout_add(5000, request_expired, &request);
+    finish_request(&request, FALSE);
+    g_assert_cmpuint(request.request_timer, ==, 0);
+    g_assert_false(request.pending);
+    request_expired(&request);
+    g_assert_true(g_cancellable_is_cancelled(request.cancel));
+    g_cancellable_reset(request.cancel);
+    g_assert_false(g_cancellable_is_cancelled(request.cancel));
+    g_object_unref(request.cancel);
     const char *cases[] = {"{}", "{\"main_pc\":false,\"server\":[],\"history\":[null,1,{}]}",
         "{\"main_pc\":{\"machine\":\"긴 이름 한국어 workstation\",\"cpu_percent\":null,\"memory\":false},"
         "\"server\":{\"filesystems\":[null,{},false],\"network\":null}}"};
@@ -621,11 +663,16 @@ static int self_test(void) {
         g_assert_true(accept_payload(&a, cases[i], -1)); render(&a, cr, 1200, 1920);
         g_assert_cmpint(cairo_status(cr), ==, CAIRO_STATUS_SUCCESS);
     }
-    load_sample(&a); render(&a, cr, 1200, 1920);
+    load_sample(&a);
+    GString *version = g_string_new(NULL);
+    for (guint i = 0; i < 100; i++) g_string_append(version, "한");
+    json_object_set_string_member(object(root(&a), "main_pc"), "agent_version", version->str);
+    g_string_free(version, TRUE);
+    render(&a, cr, 1200, 1920);
     a.connected = FALSE; render(&a, cr, 600, 960);
     g_assert_cmpint(cairo_status(cr), ==, CAIRO_STATUS_SUCCESS);
     cairo_destroy(cr); cairo_surface_destroy(s); g_clear_object(&a.parser);
-    g_print("Self-test passed: parsing, malformed data, retained snapshot, rendering.\n");
+    g_print("Self-test passed: parsing, malformed data, retained snapshot, formatting, request deadline, rendering.\n");
     return 0;
 }
 int main(int argc, char **argv) {
