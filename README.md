@@ -1,7 +1,6 @@
 # RTK native hardware monitor
 
 A C / GTK 3 / Cairo telemetry display for the dedicated 1200×1920 monitor.
-The original Python implementation remains available as `hardware-dashboard.py`.
 
 The display uses a monochrome canvas and two identical 610-point host cards.
 Both cards share the same renderer, spacing, headings, type scale and order:
@@ -39,8 +38,14 @@ make preview
 ```
 
 `preview-native.png` uses sample data and is rendered by the actual C renderer.
-Both checks and preview generation work without a graphical display. Pango
+The checks and preview generation work without a graphical display. Pango
 handles Unicode, Korean text, and ellipsis; install `fonts-noto-cjk` if needed.
+
+`make check` runs a syntax-only C compilation, shell checks, launcher regression
+checks, and the headless C self-test. `make check-syntax` only needs the compiler
+and development headers; `make check-shell` needs Bash and Python 3, with no GTK
+or display. Launcher tests mock process and desktop commands and make no network
+requests.
 
 Run in a graphical session:
 
@@ -51,7 +56,9 @@ Run in a graphical session:
 ## Runtime
 
 - Asynchronous HTTP fetch from `http://127.0.0.1:8088/status.json` every 3 seconds.
-- Only one request at a time, a 2-second socket timeout, and a 2 MiB response cap.
+- Only one request at a time, a 2-second socket timeout, a 5-second total request
+  deadline, and a 2 MiB response cap. Timed-out requests retain the last snapshot
+  and the next refresh can retry.
 - Repaints when the JSON or connection state changes, or GTK requests a redraw.
 - Keeps the last valid snapshot on HTTP, transport, or JSON errors.
 - Displays up to 90 history samples, three filesystems, and twelve temperature
@@ -64,18 +71,27 @@ Run in a graphical session:
 
 ## Deployment status
 
-Built as `/home/eruin/project/rtk-hardware-monitor/hardware-dashboard`. Autostart,
-restart, and watchdog launchers execute this native binary directly. Process matching is
-exact so restarting the dashboard does not match unrelated shell commands.
-The `eruin-kiosk-watchdog.service` user service owns the persistent launch.
+The native launchers are `scripts/restart-kiosk.sh` and
+`scripts/kiosk-watchdog.sh`. They find the binary beside the `scripts/` directory
+and match its literal command line for the current user. The watchdog uses
+`curl` to probe the local feed and only launches when it is healthy. It retries
+failed launches and restarts after recovery from two or more failed probes.
 
-Validation: compiler warnings enabled, parsing/rendering self-tests,
-AddressSanitizer/UndefinedBehaviorSanitizer (third-party leak detection disabled),
-and an asynchronous fetch and render against the live status endpoint.
-The rendered preview was also checked outside the sandbox. Text uses Pango
-outlines to avoid glyph-cache artifacts observed in the host environment.
+Run the launchers as the desktop user. They use the current `XDG_RUNTIME_DIR`
+(default `/run/user/$(id -u)`) and preserve supplied display/session variables,
+or detect `wayland-0` / `wayland-1`. The runtime directory must be owned by the
+user with no group/other access. Logs and lock files live in its private
+`rtk-hardware-monitor/` subdirectory, rather than `/tmp`; each launch replaces
+`hardware-dashboard.log`. `flock` (util-linux) prevents duplicate watchdogs and
+serializes manual restarts with watchdog actions. A restart returns failure if
+the executable is missing, the old process does not stop, or the new one exits.
+The `eruin-kiosk-watchdog.service` user service is expected to own the watchdog;
+its unit is not included here.
 
-The original Python implementation remains in this project. Current launcher scripts
-are in `scripts/`; the previous launchers are preserved in `deployment-backup/`.
-The earlier WebKit version is also preserved there. CPU and power savings have not
-been benchmarked.
+`scripts/move-kiosk-to-dp.sh` is a legacy Firefox launcher with hard-coded monitor
+and account settings. It does not place the native dashboard; do not use it for
+native deployment. `scripts/configure-korean-input.sh` changes the original
+account's desktop input/font settings and is also host-specific. Neither script
+is part of the native launch path. Earlier Python/WebKit implementations and
+backups mentioned in older documentation are not included in this source tree.
+CPU and power savings have not been benchmarked.

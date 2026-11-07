@@ -1,34 +1,31 @@
 #!/usr/bin/env bash
-set -u
+set -Eeuo pipefail
+source "$(dirname -- "${BASH_SOURCE[0]}")/kiosk-common.sh"
 
 readonly url=http://127.0.0.1:8088/health
-readonly runtime_dir=/run/user/1000
-readonly app=/home/eruin/project/rtk-hardware-monitor/hardware-dashboard
-readonly app_pattern='/home/eruin/project/rtk-hardware-monitor/hardware-dashboard'
 fail_count=0
-
-launch_dashboard() {
-    XDG_RUNTIME_DIR="$runtime_dir" \
-        DBUS_SESSION_BUS_ADDRESS="unix:path=${runtime_dir}/bus" \
-        WAYLAND_DISPLAY=wayland-0 \
-        DISPLAY=:0 \
-        setsid -f "$app" >/tmp/hardware-dashboard.log 2>&1
-}
+exec 8>"$kiosk_dir/watchdog.lock"
+flock -n 8 || exit 0
 
 while true; do
     if curl -fsS -m 3 "$url" >/dev/null 2>&1; then
+        exec 9>"$kiosk_dir/launch.lock"
+        flock -x 9
         if (( fail_count >= 2 )); then
             logger -t kiosk-watchdog \
-                "dashboard recovered after ${fail_count} failed probes -> restarting app"
-            pkill -u eruin -fx "$app_pattern" 2>/dev/null || true
-            sleep 2
+                "dashboard recovered after ${fail_count} failed probes -> restarting app" || true
+            if ! stop_dashboard; then
+                flock -u 9
+                sleep 30
+                continue
+            fi
         fi
         fail_count=0
-        if ! pgrep -u eruin -fx "$app_pattern" >/dev/null 2>&1; then
-            logger -t kiosk-watchdog "dashboard app not running -> launching"
-            launch_dashboard
-            sleep 5
+        if ! dashboard_running; then
+            logger -t kiosk-watchdog "dashboard app not running -> launching" || true
+            launch_dashboard || true
         fi
+        flock -u 9
     else
         fail_count=$((fail_count + 1))
     fi
